@@ -23,6 +23,7 @@ const state = {
   sightFocus: null, // 当前高亮的视线对键 `${audienceId}|${targetId}`
   rigging: null, // 吊挂布景载荷核算结果（points / items / summary）
   costumeEval: null, // 演员换装核查评估结果（items / summary，按当前模式）
+  requestSeq: 0, // 全量刷新与模式刷新共用的最新请求标识：每次发起自增，过期请求结果不得更新页面
 };
 
 /* ---------- 工具 ---------- */
@@ -95,14 +96,27 @@ function actorName(id) {
 
 /* ---------- 数据加载与渲染 ---------- */
 
+/**
+ * 全量刷新：数据 / 校验 / 换装 / 视线 / 吊挂一次拉齐。
+ * 与模式刷新共用 state.requestSeq（最新请求标识），按发起时的模式成组拉取校验与换装结果；
+ * 仅当该组仍是最新请求、且返回的模式与当前模式一致时才落库与重绘。
+ * 刷新被更新的请求取代（或模式已变化）时返回 false，调用方不应再据此提示或更新其他界面。
+ */
 async function refresh() {
+  const seq = ++state.requestSeq;
+  const mode = state.mode;
   const [data, validation, sightlines, rigging, costumeEval] = await Promise.all([
     api('/api/data'),
-    api(`/api/validate?mode=${state.mode}`),
+    api(`/api/validate?mode=${mode}`),
     api('/api/sightlines'),
     api('/api/rigging'),
-    api(`/api/costume-changes/evaluate?mode=${state.mode}`),
+    api(`/api/costume-changes/evaluate?mode=${mode}`),
   ]);
+
+  // 旧请求（含 A→B→A 中首次 A 的请求）晚于新请求返回时整体丢弃，不更新页面
+  if (seq !== state.requestSeq) return false;
+  if (validation.mode !== state.mode || costumeEval.mode !== state.mode) return false;
+
   state.data = data;
   state.validation = validation;
   state.sightlines = sightlines;
@@ -123,20 +137,36 @@ async function refresh() {
   renderRigPoints();
   renderRigItems();
   renderRigging();
-  await refreshEvacuation();
+  await refreshEvacuation({ seq, mode });
+  // 疏散请求返回后再校验一次（其结果也可能晚于更新的请求）
+  return seq === state.requestSeq && state.mode === mode;
 }
 
-/** 仅重新校验并刷新结果区（模式切换时使用） */
+/**
+ * 仅重新校验并刷新结果区（模式切换 / 重新校验 / 基线变更时使用）。
+ * 与全量刷新共用同一自增标识；校验、换装与疏散快照按发起时模式成组提交，
+ * 只有「对应当前模式且属于最新请求」的结果才会更新页面。
+ * A→B→A 时首次 A 的 seq 已失效，其结果不会覆盖末次 A。返回是否被采纳。
+ */
 async function refreshValidation() {
+  const seq = ++state.requestSeq;
+  const mode = state.mode;
   const [validation, costumeEval] = await Promise.all([
-    api(`/api/validate?mode=${state.mode}`),
-    api(`/api/costume-changes/evaluate?mode=${state.mode}`),
+    api(`/api/validate?mode=${mode}`),
+    api(`/api/costume-changes/evaluate?mode=${mode}`),
   ]);
+
+  if (seq !== state.requestSeq) return false;
+  if (validation.mode !== state.mode || costumeEval.mode !== state.mode) return false;
+
   state.validation = validation;
   state.costumeEval = costumeEval;
   renderValidation();
   renderDependencies();
   renderCostumeChanges();
+  // 疏散快照按发起时模式成组还原位置；守卫同 seq 与模式，过期结果不更新页面
+  await refreshEvacuation({ seq, mode });
+  return seq === state.requestSeq && state.mode === mode;
 }
 
 /** 更新「导出校验报告」链接：已生成疏散快照时携带同一快照参数，报告将追加同一快照 */
@@ -603,8 +633,13 @@ function renderEvacExitOptions() {
       .join('') || '<span class="empty-hint">暂无区域，请先在下方添加舞台区域</span>';
 }
 
-/** 拉取并渲染疏散快照；未启用时显示操作提示 */
-async function refreshEvacuation() {
+/**
+ * 拉取并渲染疏散快照；未启用时显示操作提示。
+ * @param {{seq:number, mode:string}|null} guard 全量 / 模式刷新成组调用时传入：
+ *   仅当该组仍是最新请求（seq === state.requestSeq）且模式未再变化时才应用结果；
+ *   表单提交 / 清除等用户直接操作不传守卫，始终执行。
+ */
+async function refreshEvacuation(guard = null) {
   const el = $('evacuation-results');
   if (!state.evacuation) {
     state.evacResult = null;
@@ -612,7 +647,7 @@ async function refreshEvacuation() {
     updateExportHref();
     return;
   }
-  // 出口区域可能已被删除：剔除失效选项；全部失效则停用快照
+  // 出口区域可能已删除：剔除失效选项；全部失效则停用快照
   const valid = new Set(state.data.areas.map((a) => a.id));
   state.evacuation.exits = state.evacuation.exits.filter((id) => valid.has(id));
   if (state.evacuation.exits.length === 0) {
@@ -624,10 +659,19 @@ async function refreshEvacuation() {
     renderEvacExitOptions();
     return;
   }
+  const reqMode = guard ? guard.mode : state.mode;
   const { time, exits } = state.evacuation;
-  state.evacResult = await api(
-    `/api/evacuation?mode=${state.mode}&time=${time}&exits=${exits.map(encodeURIComponent).join(',')}`
+  const result = await api(
+    `/api/evacuation?mode=${reqMode}&time=${time}&exits=${exits.map(encodeURIComponent).join(',')}`
   );
+  // 成组请求需「仍是最新请求」；任何路径都要求返回模式与当前模式一致，否则丢弃（A→B→A 同理）
+  if (guard && guard.seq !== state.requestSeq) return;
+  if (result.mode !== state.mode) return;
+  // 等待期间快照可能已被用户清除 / 重新生成：参数已变化则丢弃本次结果
+  if (!state.evacuation || state.evacuation.time !== time || state.evacuation.exits.join(',') !== exits.join(',')) {
+    return;
+  }
+  state.evacResult = result;
   renderEvacuation();
   updateExportHref();
 }
@@ -1302,7 +1346,9 @@ function clearCueForm() {
 async function mutate(fn, successMsg) {
   try {
     await fn();
-    await refresh();
+    const applied = await refresh();
+    // 刷新被更新的请求（如快速切换模式 / 再次校验）取代：本次结果未落盘到页面，不提示成功
+    if (applied === false) return;
     refreshSelects();
     if (successMsg) toast(successMsg);
   } catch (err) {
@@ -1540,8 +1586,9 @@ function bindHeaderActions() {
       if (btn.dataset.mode === state.mode) return;
       setMode(btn.dataset.mode);
       try {
-        await refreshValidation();
-        await refreshEvacuation(); // 快照按当前校验模式还原位置，模式切换后随动重算
+        // 校验 / 换装 / 疏散按切换时模式成组拉取；返回 false 表示已被更新的请求取代，不提示
+        const applied = await refreshValidation();
+        if (!applied) return;
         const otherMode = state.mode === 'propagate' ? 'classic' : 'propagate';
         const meta = state.validation.baselines || {};
         if (meta[state.mode]) toast(`已切换到「${MODE_NAME[state.mode]}」，已加载该模式基线对比`);
@@ -1720,7 +1767,8 @@ function bindImport() {
       });
       const msg = `✅ 导入完成：新增 ${result.createdActors} 位演员、${result.createdCues} 条到位口令，已刷新校验结果。`;
       clearImport();
-      await refresh();
+      const applied = await refresh();
+      if (applied === false) return; // 期间已有更新的刷新请求：不展示本次成功提示
       refreshSelects();
       renderImportMessage(msg);
       toast(msg);
